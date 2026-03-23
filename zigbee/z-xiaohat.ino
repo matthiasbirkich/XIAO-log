@@ -2,244 +2,216 @@
 #error "Zigbee end device mode is not selected in Tools->Zigbee mode"
 #endif
 
-// import necessary libraries
+// ─── Libraries ────────────────────────────────────────────────────────────────
 #include <Wire.h>
 #include <Arduino.h>
 #include "Zigbee.h"
 #include <SensirionI2cSht4x.h>
 #include <BH1750.h>
 
-// zigbee configs from https://docs.espressif.com/projects/arduino-esp32/en/latest/libraries.html#zigbee-apis
+// ─── Zigbee endpoints ─────────────────────────────────────────────────────────
 #define TEMP_SENSOR_ENDPOINT_NUMBER 10
-// using analog device to transfer the lux value
 #define ANALOG_DEVICE_ENDPOINT_NUMBER 1
-// Conversion factor for micro seconds to seconds
-#define uS_TO_S_FACTOR 1000000ULL
-// Sleep for 5 minutes
-#define TIME_TO_SLEEP 300
-// Timeout for response from coordinator in ms
-#define REPORT_TIMEOUT 2000 
-// Set to 0 to use local callback specified directly for the endpoint.
-#define USE_GLOBAL_ON_RESPONSE_CALLBACK 1  
-uint8_t dataToSend = 2;
-bool resend = false; 
 
-ZigbeeTempSensor zbTempSensor = ZigbeeTempSensor(TEMP_SENSOR_ENDPOINT_NUMBER);
-ZigbeeAnalog zbAnalogLux = ZigbeeAnalog(ANALOG_DEVICE_ENDPOINT_NUMBER);
+// ─── Timing ───────────────────────────────────────────────────────────────────
+#define uS_TO_S_FACTOR 1000000ULL  // µs → s
+#define TIME_TO_SLEEP 300          // deep-sleep duration (seconds)
+#define JOIN_TIMEOUT_MS 60000      // max time to join network (ms)
+#define POST_JOIN_DELAY_MS 3000    // settle time after joining (ms)
+#define REPORT_WAIT_MS 10000       // max wait for report ACKs (ms)
+#define KEEPALIVE_EXTRA_S 60       // extra margin on top of sleep (seconds)
 
-// define pin connections with XIAO board
-uint8_t led = LED_BUILTIN;
-uint8_t button = BOOT_PIN;
-const int ADC_pin = A1;
+// ─── Pins ─────────────────────────────────────────────────────────────────────
+const uint8_t PIN_LED = LED_BUILTIN;
+const uint8_t PIN_BUTTON = BOOT_PIN;
 
-// setup temp & hum sensor
+// ─── Zigbee objects ───────────────────────────────────────────────────────────
+ZigbeeTempSensor zbTempSensor(TEMP_SENSOR_ENDPOINT_NUMBER);
+ZigbeeAnalog zbAnalogLux(ANALOG_DEVICE_ENDPOINT_NUMBER);
+
+// ─── Sensor objects ───────────────────────────────────────────────────────────
 SensirionI2cSht4x sht40;
-static char errorMessage[64];
-static int16_t error;
-// setup light sensor
 BH1750 bh1750;
 
-/************************ Callbacks *****************************/
-#if USE_GLOBAL_ON_RESPONSE_CALLBACK
-void onGlobalResponse(zb_cmd_type_t command, esp_zb_zcl_status_t status, uint8_t endpoint, uint16_t cluster) {
-  Serial.printf("Global response command: %d, status: %s, endpoint: %d, cluster: 0x%04x\r\n", command, esp_zb_zcl_status_to_name(status), endpoint, cluster);
-  if ((command == ZB_CMD_REPORT_ATTRIBUTE) && (endpoint == TEMP_SENSOR_ENDPOINT_NUMBER)) {
-    switch (status) {
-      case ESP_ZB_ZCL_STATUS_SUCCESS: dataToSend--; break;
-      case ESP_ZB_ZCL_STATUS_FAIL:    resend = true; break;
-      default:                        break;  // add more statuses like ESP_ZB_ZCL_STATUS_INVALID_VALUE, ESP_ZB_ZCL_STATUS_TIMEOUT etc.
-    }
-  }
+// ─── Report-tracking state ────────────────────────────────────────────────────
+// Each successful report call decrements the counter; we wait until it
+// reaches 0 (or the REPORT_WAIT_MS timeout) before sleeping.
+volatile int8_t pendingReports = 0;
+volatile bool needResend = false;
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+void goToSleep() {
+  Serial.printf("Going to sleep for %d seconds.\r\n", TIME_TO_SLEEP);
+  Serial.flush();
+  esp_deep_sleep_start();
 }
-#else
-void onResponse(zb_cmd_type_t command, esp_zb_zcl_status_t status) {
-  Serial.printf("Response command: %d, status: %s\r\n", command, esp_zb_zcl_status_to_name(status));
+
+// ─── Zigbee response callbacks ────────────────────────────────────────────────
+void onTempSensorResponse(zb_cmd_type_t command, esp_zb_zcl_status_t status) {
+  Serial.printf("[TempSensor] cmd=%d status=%s\r\n",
+                command, esp_zb_zcl_status_to_name(status));
   if (command == ZB_CMD_REPORT_ATTRIBUTE) {
-    switch (status) {
-      case ESP_ZB_ZCL_STATUS_SUCCESS: dataToSend--; break;
-      case ESP_ZB_ZCL_STATUS_FAIL:    resend = true; break;
-      default:                        break;  // add more statuses like ESP_ZB_ZCL_STATUS_INVALID_VALUE, ESP_ZB_ZCL_STATUS_TIMEOUT etc.
+    if (status == ESP_ZB_ZCL_STATUS_SUCCESS) {
+      pendingReports--;
+    } else if (status == ESP_ZB_ZCL_STATUS_FAIL) {
+      needResend = true;
     }
   }
 }
-#endif
 
-/********************* Arduino functions **************************/
+void onAnalogLuxResponse(zb_cmd_type_t command, esp_zb_zcl_status_t status) {
+  Serial.printf("[AnalogLux]  cmd=%d status=%s\r\n",
+                command, esp_zb_zcl_status_to_name(status));
+  if (command == ZB_CMD_REPORT_ATTRIBUTE) {
+    if (status == ESP_ZB_ZCL_STATUS_SUCCESS) {
+      pendingReports--;
+    } else if (status == ESP_ZB_ZCL_STATUS_FAIL) {
+      needResend = true;
+    }
+  }
+}
+
+// ─── Send readings and wait for ACKs ─────────────────────────────────────────
+void sendReports(float temp, float humi, uint16_t lux) {
+  zbTempSensor.setTemperature(temp);
+  zbTempSensor.setHumidity(humi);
+  zbAnalogLux.setAnalogInput((float)lux);
+
+  const int maxRetries = 3;
+  for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    pendingReports = 2;  // expecting one ACK from each endpoint
+    needResend = false;
+
+    Serial.printf("Sending reports (attempt %d/%d)...\r\n", attempt, maxRetries);
+    zbTempSensor.report();
+    zbAnalogLux.reportAnalogInput();
+
+    unsigned long t0 = millis();
+    while (pendingReports > 0 && (millis() - t0) < REPORT_WAIT_MS) {
+      if (needResend) {
+        Serial.println("Coordinator signalled failure – resending.");
+        needResend = false;
+        pendingReports = 2;
+        zbTempSensor.report();
+        zbAnalogLux.reportAnalogInput();
+        t0 = millis();  // reset timeout after resend
+      }
+      delay(100);
+    }
+
+    if (pendingReports <= 0) {
+      Serial.println("All reports acknowledged.");
+      return;
+    }
+
+    Serial.printf("Report attempt %d timed out (pending=%d).\r\n",
+                  attempt, pendingReports);
+  }
+
+  Serial.println("All retries exhausted – sleeping anyway.");
+}
+
+// ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
-  
   Serial.begin(115200);
-  Serial.println("Zigbee device start");
+  Serial.println("\r\n=== XIAO HAT Zigbee sensor starting ===");
 
-  // Configure builtin LED and turn it OFF (HIGH)
-  pinMode(led, OUTPUT);
-  digitalWrite(led, HIGH);
-  // Init button for factory reset
-  pinMode(button, INPUT_PULLUP);
-  // setup ADC battery voltage pin
-  pinMode(ADC_pin, INPUT);
+  // LED off (active-low on XIAO)
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, HIGH);
 
-  // initialize I2C communication
+  // Boot button → factory-reset Zigbee if held at startup
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  if (digitalRead(PIN_BUTTON) == LOW) {
+    Serial.println("Boot button held – performing Zigbee factory reset!");
+    Zigbee.factoryReset();  // clears stored network credentials
+  }
+
+  // Configure deep-sleep wakeup timer now; used in all exit paths
+  esp_sleep_enable_timer_wakeup((uint64_t)TIME_TO_SLEEP * uS_TO_S_FACTOR);
+
+  // ── I2C & sensors ──────────────────────────────────────────────────────────
   Wire.begin();
 
-  // init SHT40 sensor
+  // SHT40 temperature & humidity
   sht40.begin(Wire, SHT40_I2C_ADDR_44);
   sht40.softReset();
   delay(10);
-  uint32_t serialNumber = 0;
-  error = sht40.serialNumber(serialNumber);
-  if (error != 0) {
-      Serial.print("Error trying to execute serialNumber(): ");
-      errorToString(error, errorMessage, sizeof errorMessage);
-      Serial.println(errorMessage);
-      return;
-  }
-  Serial.print("serialNumber: ");
-  Serial.print(serialNumber);
-  Serial.println();
 
-  // get sht40 measurements
-  float temp = 0.0;
-  float humi = 0.0;
-
+  float temp = 0.0f, humi = 0.0f;
   delay(20);
-  error = sht40.measureLowestPrecision(temp, humi);
-  if (error != 0) {
-      Serial.print("Error trying to execute measureLowestPrecision(): ");
-      errorToString(error, errorMessage, sizeof errorMessage);
-      Serial.println(errorMessage);
-      return;
+  int16_t shtError = sht40.measureLowestPrecision(temp, humi);
+  if (shtError != 0) {
+    char errMsg[64];
+    errorToString(shtError, errMsg, sizeof(errMsg));
+    Serial.printf("SHT40 error: %s – will report 0 values.\r\n", errMsg);
+    temp = 0.0f;
+    humi = 0.0f;
+    // Do NOT return here; continue so the device can still sleep properly
+  } else {
+    Serial.printf("SHT40 → Temp: %.2f °C  Humi: %.1f %%\r\n", temp, humi);
   }
-  Serial.print("Temperature: ");
-  Serial.print(temp);
-  Serial.print("\t");
-  Serial.print("Humidity: ");
-  Serial.print(humi);
-  Serial.println();
 
-  // initialize BH1750 sensor
+  // BH1750 illuminance
   bh1750.begin();
-
-  // Get luminosity from bh1750 sensor
   uint16_t lux = bh1750.readLightLevel();
-  // print results
-  Serial.print("Light: ");
-  Serial.print(lux);
-  Serial.println();
+  Serial.printf("BH1750 → Lux: %u\r\n", lux);
 
-  // Get battery voltage
-  uint32_t Vbat = 0;
-  for(int i = 0; i < 10; i++) {
-    Vbat = Vbat + analogReadMilliVolts(ADC_pin);
-    delay(20);
-  }
-  float Vbatf = 2 * Vbat / 10 / 1000.0;
-  float Vbatp = (Vbatf - 3) * (100) / (1.2);
-  if (Vbatp < 0) { Vbatp = 0;
-  } else if (Vbatp > 100) { Vbatp = 100;}
-  // print results
-  Serial.print("Battery voltage: ");
-  Serial.print(Vbatf, 3);
-  Serial.print(" V");
-  Serial.println("\t");
-  Serial.print("Battery percentage: ");
-  Serial.print(Vbatp, 1);
-  Serial.println(" %");
-
-  // Configure the wake up source and set to wake up every 30 minutes
-  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
-
-  //set tempsensor zigbee settings
-  zbTempSensor.setManufacturerAndModel("Z-XIAO", "HAT");
+  // ── Zigbee configuration ───────────────────────────────────────────────────
+  zbTempSensor.setManufacturerAndModel("Z-XIAO", "HAT 02");
   zbTempSensor.setMinMaxValue(-20, 80);
   zbTempSensor.setTolerance(1);
   zbTempSensor.addHumiditySensor(0, 100, 1);
-  // Set up analog input for lux value
+  zbTempSensor.onDefaultResponse(onTempSensorResponse);
+
   zbAnalogLux.addAnalogInput();
   zbAnalogLux.setAnalogInputApplication(ESP_ZB_ZCL_AI_COUNT_UNITLESS_OTHER);
   zbAnalogLux.setAnalogInputDescription("Illuminance");
   zbAnalogLux.setAnalogInputResolution(1);
+  zbAnalogLux.onDefaultResponse(onAnalogLuxResponse);
 
-#if USE_GLOBAL_ON_RESPONSE_CALLBACK
-  // Global callback for all endpoints with more params to determine the endpoint and cluster in the callback function.
-  Zigbee.onGlobalDefaultResponse(onGlobalResponse);
-#else
-  // Callback specified for endpoint
-  zbTempSensor.onDefaultResponse(onResponse);
-#endif
-
-  //Add endpoints to Zigbee Core
   Zigbee.addEndpoint(&zbTempSensor);
   Zigbee.addEndpoint(&zbAnalogLux);
-  // Create a default Zigbee configuration for End Device
+
+  // Keep-alive must comfortably exceed the sleep period so the coordinator
+  // doesn't mark us as offline between wake-ups.
   esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
-  zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = 10000;
-  // Set timeout for Zigbee Begin to 10s (default is 30s)
-  Zigbee.setTimeout(10000);  
-  Serial.println("Starting Zigbee...");
+  zigbeeConfig.nwk_cfg.zed_cfg.keep_alive =
+    (TIME_TO_SLEEP + KEEPALIVE_EXTRA_S) * 1000;
 
-  // When all EPs are registered, start Zigbee. By default acts as ZIGBEE_END_DEVICE
+  Zigbee.setTimeout(10000);  // 10 s to start Zigbee stack
+
+  Serial.println("Starting Zigbee stack...");
   if (!Zigbee.begin(&zigbeeConfig, false)) {
-    Serial.println("Zigbee failed to start!");
-    Serial.println("Rebooting...");
+    Serial.println("Zigbee failed to start – rebooting.");
     ESP.restart();
-  } else {
-    Serial.println("Zigbee started successfully!");
   }
+  Serial.println("Zigbee stack started.");
 
-  Serial.println("Connecting to network");
+  // ── Network join ──────────────────────────────────────────────────────────
+  Serial.print("Joining network");
+  unsigned long joinStart = millis();
   while (!Zigbee.connected()) {
     Serial.print(".");
     delay(300);
-  }
-  Serial.println();
-  Serial.println("Successfully connected to Zigbee network");
-  // Delay approx 1s (may be adjusted) to allow establishing proper connection with coordinator, needed for sleepy devices
-  delay(1000);
-
-  // Update temperature and humidity values in Temperature sensor EP
-  zbTempSensor.setTemperature(temp);
-  zbTempSensor.setHumidity(humi);
-  //zbTempSensor.setBatteryPercentage(Vbatp);
-  //zbTempSensor.setBatteryVoltage(Vbatf*10);
-  zbAnalogLux.setAnalogInput(lux);
-  // Report values
-  zbTempSensor.report();
-  delay(100);
-  //zbTempSensor.reportBatteryPercentage();
-  zbAnalogLux.reportAnalogInput();
-  
-  unsigned long startTime = millis();
-  const unsigned long timeout = REPORT_TIMEOUT;
-
-  Serial.printf("Waiting for data report to be confirmed \r\n");
-  // Wait until data was successfully sent
-  int tries = 0;
-  const int maxTries = 5;
-  while (dataToSend != 0 && tries < maxTries) {
-    if (resend) {
-      Serial.println("Resending data on failure!");
-      resend = false;
-      dataToSend = 2;
-      zbTempSensor.report();  // report again
-      zbAnalogLux.reportAnalogInput();
+    if (millis() - joinStart > JOIN_TIMEOUT_MS) {
+      Serial.println("\r\nJoin timed out – rebooting.");
+      ESP.restart();
     }
-    if (millis() - startTime >= timeout) {
-      Serial.println("\nReport timeout! Report Again");
-      dataToSend = 2;
-      zbTempSensor.report();  // report again
-      zbAnalogLux.reportAnalogInput();
-      startTime = millis();
-      tries++;
-    }
-    Serial.printf(".");
-    delay(100);  // 50ms delay to avoid busy-waiting
   }
+  Serial.println("\r\nConnected to Zigbee network.");
 
-  // Put device to deep sleep
-  Serial.printf("Going to sleep for %d seconds\r\n", TIME_TO_SLEEP);
-  esp_deep_sleep_start();
+  // Give the coordinator a moment to fully register the device
+  delay(POST_JOIN_DELAY_MS);
+
+  // ── Report sensor values ──────────────────────────────────────────────────
+  sendReports(temp, humi, lux);
+
+  // ── Sleep ─────────────────────────────────────────────────────────────────
+  goToSleep();
 }
 
+// ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
-  // nothing here
+  // Everything runs in setup(); the device never reaches loop().
 }
