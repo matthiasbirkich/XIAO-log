@@ -28,7 +28,7 @@ This contribution adds an Arduino/Bluefruit logger implementation for the Seeed 
 
 Do not select the mbed-enabled board package for this sketch, because the firmware uses `bluefruit.h`.
 
-## BLE overview
+## BLE overview (nRF-connect App)
 
 BLE device name:
 
